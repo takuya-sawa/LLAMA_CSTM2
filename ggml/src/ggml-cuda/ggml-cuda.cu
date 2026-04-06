@@ -140,6 +140,18 @@ static cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device)
 
             err = cudaMalloc(ptr, size);
         }
+#else
+        // NVIDIA CUDA: fall back to cudaMalloc if Unified Memory fails
+        // (e.g. on Windows where cudaMallocManaged has restrictions)
+        if (err != cudaSuccess) {
+            static bool warned_unified = false;
+            if (!warned_unified) {
+                GGML_LOG_WARN("cudaMallocManaged failed (err=%d), falling back to cudaMalloc.\n", (int)err);
+                warned_unified = true;
+            }
+            cudaGetLastError(); // clear error
+            err = cudaMalloc(ptr, size);
+        }
 #endif // defined(GGML_USE_HIP)
     } else {
         err = cudaMalloc(ptr, size);
@@ -357,7 +369,13 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
         for (int i = 0; i < MAX_BUFFERS; ++i) {
             ggml_cuda_buffer & b = buffer_pool[i];
             if (b.ptr != nullptr) {
-                CUDA_CHECK(cudaFree(b.ptr));
+                cudaPointerAttributes attrs = {};
+                if (cudaPointerGetAttributes(&attrs, b.ptr) == cudaSuccess &&
+                    attrs.type == cudaMemoryTypeHost) {
+                    CUDA_CHECK(cudaFreeHost(b.ptr));
+                } else {
+                    CUDA_CHECK(cudaFree(b.ptr));
+                }
                 pool_size -= b.size;
             }
         }
@@ -406,7 +424,22 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
         size_t look_ahead_size = (size_t) (1.05 * size);
         look_ahead_size = 256 * ((look_ahead_size + 255)/256);
         ggml_cuda_set_device(device);
-        CUDA_CHECK(ggml_cuda_device_malloc(&ptr, look_ahead_size, device));
+        cudaError_t alloc_err = ggml_cuda_device_malloc(&ptr, look_ahead_size, device);
+        if (alloc_err != cudaSuccess && getenv("GGML_CUDA_ENABLE_UNIFIED_MEMORY") != nullptr) {
+            // VRAM exhausted: fall back to pinned host memory accessible by GPU via PCIe.
+            // This is slower but allows training on GPUs with limited VRAM.
+            cudaGetLastError(); // clear error
+            alloc_err = cudaMallocHost(&ptr, look_ahead_size);
+            if (alloc_err == cudaSuccess) {
+                static bool warned_host_fallback = false;
+                if (!warned_host_fallback) {
+                    GGML_LOG_WARN("VRAM exhausted: using pinned host memory as overflow (%.1f MB). Performance will be reduced.\n",
+                                  (float)look_ahead_size / 1024.0f / 1024.0f);
+                    warned_host_fallback = true;
+                }
+            }
+        }
+        CUDA_CHECK(alloc_err);
         *actual_size = look_ahead_size;
         pool_size += look_ahead_size;
 #ifdef DEBUG_CUDA_MALLOC
@@ -427,7 +460,14 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
         }
         GGML_LOG_DEBUG(GGML_CUDA_NAME " buffer pool full, increase MAX_CUDA_BUFFERS\n");
         ggml_cuda_set_device(device);
-        CUDA_CHECK(cudaFree(ptr));
+        // Determine correct free function: device vs pinned host memory
+        cudaPointerAttributes attrs = {};
+        if (cudaPointerGetAttributes(&attrs, ptr) == cudaSuccess &&
+            attrs.type == cudaMemoryTypeHost) {
+            CUDA_CHECK(cudaFreeHost(ptr));
+        } else {
+            CUDA_CHECK(cudaFree(ptr));
+        }
         pool_size -= size;
     }
 };
