@@ -899,8 +899,27 @@ void ggml_opt_eval(ggml_opt_context_t opt_ctx, ggml_opt_result_t result) {
                 const float beta1h = 1.0f / (1.0f - powf(opt_pars.adamw.beta1, opt_ctx->iter));
                 const float beta2h = 1.0f / (1.0f - powf(opt_pars.adamw.beta2, opt_ctx->iter));
 
+                // --- Learning rate schedule: linear warmup + cosine decay ---
+                float alpha = opt_pars.adamw.alpha;
+                {
+                    const int64_t step = opt_ctx->iter;  // 1-based optimizer step count
+                    const int64_t ws   = opt_ctx->warmup_steps;
+                    const int64_t ts   = opt_ctx->total_steps;
+
+                    if (ws > 0 && step <= ws) {
+                        // Linear warmup: lr increases from ~0 to lr0
+                        alpha *= (float)step / (float)ws;
+                    } else if (ts > 0 && ts > ws) {
+                        // Cosine decay after warmup: lr decreases from lr0 to lr0*min_lr_ratio
+                        float progress = (float)(step - ws) / (float)(ts - ws);
+                        if (progress > 1.0f) progress = 1.0f;
+                        const float r = opt_ctx->min_lr_ratio;
+                        alpha *= r + (1.0f - r) * 0.5f * (1.0f + cosf(3.14159265f * progress));
+                    }
+                }
+
                 float * adamw_par_data = ggml_get_data_f32(opt_ctx->opt_step_params);
-                adamw_par_data[0] = opt_pars.adamw.alpha;
+                adamw_par_data[0] = alpha;
                 adamw_par_data[1] = opt_pars.adamw.beta1;
                 adamw_par_data[2] = opt_pars.adamw.beta2;
                 adamw_par_data[3] = opt_pars.adamw.eps;
