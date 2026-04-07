@@ -817,7 +817,14 @@ void ggml_opt_prepare_alloc(
 
 void ggml_opt_alloc(ggml_opt_context_t opt_ctx, bool backward) {
     GGML_ASSERT(!opt_ctx->eval_ready);
-    if (opt_ctx->build_type == GGML_OPT_BUILD_TYPE_OPT && opt_ctx->opt_period > 1 && opt_ctx->opt_i == 0) {
+    // Reset grad_accs at the start of each gradient-accumulation window.
+    // For opt_period == 1, every step is its own window so grad_accs must be
+    // zeroed before every backward pass. Without this, gradients accumulate
+    // across steps and AdamW sees the sum of ALL historical gradients instead
+    // of only the current step's gradient — causing train loss to increase.
+    // We reset gb_grad (not gb_opt) so that AdamW momentum/velocity (m, v)
+    // are preserved — gb_grad has no OPT_STEP_ADAMW nodes.
+    if (opt_ctx->build_type == GGML_OPT_BUILD_TYPE_OPT && opt_ctx->opt_i == 0) {
         ggml_graph_reset(opt_ctx->gb_grad);
     }
     if (backward) {

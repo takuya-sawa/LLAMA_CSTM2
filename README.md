@@ -12,7 +12,7 @@
 |----------|------|
 | `ggml/src/ggml-cuda/ggml-cuda.cu` | Unified Memory + ピンドホスト RAM フォールバック |
 | `ggml/src/ggml-cuda/out-prod.cu` | 全量子化型の GPU バックワード（OUT_PROD 演算） |
-| `ggml/src/ggml-opt.cpp` | epoch 境界でのグラジェントリセット（loss spike 修正） |
+| `ggml/src/ggml-opt.cpp` | グラジェントリセット修正（epoch 境界 spike + static graphs 蓄積バグ） |
 | `examples/training/finetune.cpp` | n_ctx パディング修正（ゼロロス ubatch バグ修正） |
 | `src/llama-context.cpp` | 負ラベルインデックスガード |
 
