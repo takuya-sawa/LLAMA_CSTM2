@@ -724,11 +724,22 @@ int main(int argc, char ** argv) {
             ggml_opt_optimizer_name(params.optimizer), (double) lr.lr0, (double) lr.wd, (double) lr.lr_min, (double) lr.decay_epochs,
             (unsigned) lr.epochs, (double) params.n_batch / params.n_ubatch, (double) params.val_split);
 
+    // Use flat LR so cosine warmup+decay schedule in ggml_opt_eval is the sole controller.
+    // common_opt_lr_pars applies epoch-based exponential decay on top of cosine, causing double decay.
+    auto finetune_opt_pars = [](void * userdata) -> ggml_opt_optimizer_params {
+        ggml_opt_optimizer_params result = ggml_opt_get_default_optimizer_params(nullptr);
+        const lr_opt & d = *(const lr_opt *) userdata;
+        result.adamw.alpha = d.lr0;
+        result.sgd.alpha   = d.lr0;
+        result.sgd.wd = result.adamw.wd = d.wd;
+        return result;
+    };
+
     struct llama_opt_params lopt_params{
         /*n_ctx_train     =*/0,
         /*param_filter    =*/params.lora_adapters.empty() ? llama_opt_param_filter_all : (params.lora_train_base.empty() ? opt_param_filter_lora_only : opt_param_filter_lora_selected),
         /*param_filter_ud =*/params.lora_adapters.empty() ? nullptr : (params.lora_train_base.empty() ? nullptr : (void *) &params.lora_train_base),
-        /*get_opt_pars    =*/common_opt_lr_pars,
+        /*get_opt_pars    =*/finetune_opt_pars,
         /*get_opt_pars_ud =*/&params.lr,
         /*optimizer_type  =*/params.optimizer,
     };
@@ -833,6 +844,13 @@ int main(int argc, char ** argv) {
     bool nan_abort = false;
 
     for (lr.epoch = 0; lr.epoch < lr.epochs; ++lr.epoch) {
+        // Shuffle training data each epoch to prevent ordering bias
+        {
+            ggml_opt_context_t opt_ctx = llama_opt_context_get(ctx);
+            if (opt_ctx && idata_split > 1) {
+                ggml_opt_dataset_shuffle(opt_ctx, dataset, idata_split);
+            }
+        }
         llama_opt_epoch(ctx, dataset, result_train, result_eval, idata_split,
                         ggml_opt_epoch_callback_progress_bar_throttled, ggml_opt_epoch_callback_progress_bar_throttled);
         fprintf(stderr, "\n");
