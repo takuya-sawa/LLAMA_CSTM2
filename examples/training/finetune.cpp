@@ -378,6 +378,40 @@ static ggml_opt_dataset_t build_sft_dataset(
         return nullptr;
     }
 
+    // First pass: filter out examples that are too long for n_ctx
+    {
+        const llama_token tok_eos = llama_vocab_eos(vocab);
+        std::vector<sft_example> filtered;
+        filtered.reserve(examples.size());
+        int64_t skipped = 0;
+        for (int64_t i = 0; i < (int64_t) examples.size(); ++i) {
+            const auto & ex = examples[i];
+            const std::string prompt = "User:" + ex.user + "\nAssistant:";
+            std::string completion = ex.assistant;
+            if (completion.empty() || completion.back() != '\n') completion.push_back('\n');
+            std::vector<llama_token> tp = common_tokenize(ctx, prompt,      /*add_special=*/ true);
+            std::vector<llama_token> tc = common_tokenize(ctx, completion,  /*add_special=*/ false);
+            if ((int64_t)(tp.size() + tc.size()) > n_ctx) {
+                LOG_WRN("%s: SFT example %lld too long (%lld tokens > ctx %lld), skipping\n",
+                        __func__, (long long)i, (long long)(tp.size()+tc.size()), (long long)n_ctx);
+                ++skipped;
+                continue;
+            }
+            filtered.push_back(ex);
+        }
+        if (skipped > 0) {
+            LOG_INF("%s: skipped %lld / %lld examples (too long), using %lld examples\n",
+                    __func__, (long long)skipped, (long long)examples.size(), (long long)filtered.size());
+        }
+        examples = std::move(filtered);
+    }
+
+    if (examples.empty()) {
+        LOG_ERR("%s: no SFT examples remain after filtering (all too long for --ctx-size %lld)\n",
+                __func__, (long long)n_ctx);
+        return nullptr;
+    }
+
     ggml_opt_dataset_t dataset = ggml_opt_dataset_init(
         GGML_TYPE_I32, GGML_TYPE_I32, n_ctx, n_ctx, (int64_t) examples.size(), /*ndata_shard=*/ 1);
 
@@ -404,10 +438,8 @@ static ggml_opt_dataset_t build_sft_dataset(
         seq.insert(seq.end(), tok_comp.begin(), tok_comp.end());
 
         if ((int64_t) seq.size() > n_ctx) {
-            LOG_ERR("%s: SFT example %lld is too long for --ctx-size (tokens=%lld, n_ctx=%lld)\n",
-                    __func__, (long long) idata, (long long) seq.size(), (long long) n_ctx);
-            ggml_opt_dataset_free(dataset);
-            return nullptr;
+            // Should not happen after first-pass filtering, but guard anyway
+            GGML_ASSERT(false && "unexpected long example after filter");
         }
 
         // Fill data with EOS padding, labels masked with -1 by default.
@@ -724,22 +756,11 @@ int main(int argc, char ** argv) {
             ggml_opt_optimizer_name(params.optimizer), (double) lr.lr0, (double) lr.wd, (double) lr.lr_min, (double) lr.decay_epochs,
             (unsigned) lr.epochs, (double) params.n_batch / params.n_ubatch, (double) params.val_split);
 
-    // Use flat LR so cosine warmup+decay schedule in ggml_opt_eval is the sole controller.
-    // common_opt_lr_pars applies epoch-based exponential decay on top of cosine, causing double decay.
-    auto finetune_opt_pars = [](void * userdata) -> ggml_opt_optimizer_params {
-        ggml_opt_optimizer_params result = ggml_opt_get_default_optimizer_params(nullptr);
-        const lr_opt & d = *(const lr_opt *) userdata;
-        result.adamw.alpha = d.lr0;
-        result.sgd.alpha   = d.lr0;
-        result.sgd.wd = result.adamw.wd = d.wd;
-        return result;
-    };
-
     struct llama_opt_params lopt_params{
         /*n_ctx_train     =*/0,
         /*param_filter    =*/params.lora_adapters.empty() ? llama_opt_param_filter_all : (params.lora_train_base.empty() ? opt_param_filter_lora_only : opt_param_filter_lora_selected),
         /*param_filter_ud =*/params.lora_adapters.empty() ? nullptr : (params.lora_train_base.empty() ? nullptr : (void *) &params.lora_train_base),
-        /*get_opt_pars    =*/finetune_opt_pars,
+        /*get_opt_pars    =*/common_opt_lr_pars,
         /*get_opt_pars_ud =*/&params.lr,
         /*optimizer_type  =*/params.optimizer,
     };
@@ -810,7 +831,7 @@ int main(int argc, char ** argv) {
     }
 
     // Configure learning rate schedule: linear warmup + cosine decay.
-    // This is critical for AdamW stability â€” without warmup, large initial updates
+    // This is critical for AdamW stability â€? without warmup, large initial updates
     // can destabilize LoRA weights, causing loss reversal and NaN.
     {
         ggml_opt_context_t opt_ctx = llama_opt_context_get(ctx);
@@ -844,13 +865,6 @@ int main(int argc, char ** argv) {
     bool nan_abort = false;
 
     for (lr.epoch = 0; lr.epoch < lr.epochs; ++lr.epoch) {
-        // Shuffle training data each epoch to prevent ordering bias
-        {
-            ggml_opt_context_t opt_ctx = llama_opt_context_get(ctx);
-            if (opt_ctx && idata_split > 1) {
-                ggml_opt_dataset_shuffle(opt_ctx, dataset, idata_split);
-            }
-        }
         llama_opt_epoch(ctx, dataset, result_train, result_eval, idata_split,
                         ggml_opt_epoch_callback_progress_bar_throttled, ggml_opt_epoch_callback_progress_bar_throttled);
         fprintf(stderr, "\n");
@@ -867,7 +881,7 @@ int main(int argc, char ** argv) {
                 fprintf(stderr,
                     "\n"
                     "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n"
-                    "!!! NaN/Inf DETECTED â€” stopping training to prevent     !!!\n"
+                    "!!! NaN/Inf DETECTED â€? stopping training to prevent     !!!\n"
                     "!!! corrupted LoRA weights.                             !!!\n"
                     "!!!                                                     !!!\n"
                     "!!! epoch=%u  loss=%.6g  nan_grads=%d                   !!!\n"

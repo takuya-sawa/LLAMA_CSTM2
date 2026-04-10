@@ -1,5 +1,6 @@
 #include "out-prod.cuh"
 #include "convert.cuh"
+#include "sgemm-f32-fallback.cuh"
 
 #include <cstdint>
 
@@ -71,7 +72,7 @@ void ggml_cuda_out_prod(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     if (handle) {
         CUBLAS_CHECK(cublasSetStream(handle, stream));
     }
-    // transB for fallback: CUBLAS_OP_T on src1 ‚Üí transB=true, CUBLAS_OP_N on src1 ‚Üí transB=false
+    // transB for fallback: CUBLAS_OP_T on src1 Å® transB=true, CUBLAS_OP_N on src1 Å® transB=false
     const bool transB_fb = (src1_cublas_op == CUBLAS_OP_T);
 
     // TODO batched matrix multiplication

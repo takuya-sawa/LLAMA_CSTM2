@@ -250,9 +250,11 @@ void ggml_abort(const char * file, int line, const char * fmt, ...) {
     } else {
         // default: print error and backtrace to stderr
         fprintf(stderr, "%s\n", message);
+        fflush(stderr);
         ggml_print_backtrace();
     }
 
+    fflush(stderr);
     abort();
 }
 
@@ -650,6 +652,14 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .is_quantized             = false,
         .to_float                 = (ggml_to_float_t) ggml_fp16_to_fp32_row,
         .from_float_ref           = (ggml_from_float_t) ggml_fp32_to_fp16_row,
+    },
+    [GGML_TYPE_Q1_0] = {
+        .type_name                = "q1_0",
+        .blck_size                = QK1_0,
+        .type_size                = sizeof(block_q1_0),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_q1_0,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_q1_0_ref,
     },
     [GGML_TYPE_Q4_0] = {
         .type_name                = "q4_0",
@@ -1384,6 +1394,7 @@ enum ggml_type ggml_ftype_to_ggml_type(enum ggml_ftype ftype) {
         case GGML_FTYPE_MOSTLY_BF16:          wtype = GGML_TYPE_BF16;  break;
         case GGML_FTYPE_MOSTLY_Q4_0:          wtype = GGML_TYPE_Q4_0;  break;
         case GGML_FTYPE_MOSTLY_Q4_1:          wtype = GGML_TYPE_Q4_1;  break;
+        case GGML_FTYPE_MOSTLY_Q1_0:          wtype = GGML_TYPE_Q1_0;  break;
         case GGML_FTYPE_MOSTLY_Q5_0:          wtype = GGML_TYPE_Q5_0;  break;
         case GGML_FTYPE_MOSTLY_Q5_1:          wtype = GGML_TYPE_Q5_1;  break;
         case GGML_FTYPE_MOSTLY_Q8_0:          wtype = GGML_TYPE_Q8_0;  break;
@@ -3823,7 +3834,7 @@ struct ggml_tensor * ggml_get_rows(
     GGML_ASSERT(a->ne[2] == b->ne[1]);
     GGML_ASSERT(a->ne[3] == b->ne[2]);
     GGML_ASSERT(b->ne[3] == 1);
-    GGML_ASSERT(b->type == GGML_TYPE_I32 || b->type == GGML_TYPE_I64);
+    GGML_ASSERT(b->type == GGML_TYPE_I32);
 
     // TODO: implement non F32 return
     enum ggml_type type = GGML_TYPE_F32;
@@ -4374,7 +4385,7 @@ static int64_t ggml_calc_conv_output_size(int64_t ins, int64_t ks, int s, int p,
 }
 
 // im2col: [N, IC, IH, IW] => [N, OH, OW, IC*KH*KW]
-// a: [OCï¼ŒIC, KH, KW]
+// a: [OC?¼ŒIC, KH, KW]
 // b: [N, IC, IH, IW]
 // result: [N, OH, OW, IC*KH*KW]
 struct ggml_tensor * ggml_im2col(
@@ -4458,7 +4469,7 @@ struct ggml_tensor * ggml_conv_1d(
     struct ggml_tensor * result =
         ggml_mul_mat(ctx,
                 ggml_reshape_2d(ctx, im2col, im2col->ne[0], (im2col->ne[2] * im2col->ne[1])), // [N, OL, IC * K] => [N*OL, IC * K]
-                ggml_reshape_2d(ctx, a, (a->ne[0] * a->ne[1]), a->ne[2]));                    // [OCï¼ŒIC, K] => [OC, IC * K]
+                ggml_reshape_2d(ctx, a, (a->ne[0] * a->ne[1]), a->ne[2]));                    // [OC?¼ŒIC, K] => [OC, IC * K]
 
     result = ggml_reshape_3d(ctx, result, im2col->ne[1], a->ne[2], im2col->ne[2]); // [N, OC, OL]
 
@@ -4545,7 +4556,7 @@ GGML_API struct ggml_tensor * ggml_conv_transpose_1d(
 
 // ggml_conv_2d
 
-// a: [OCï¼ŒIC, KH, KW]
+// a: [OC?¼ŒIC, KH, KW]
 // b: [N, IC, IH, IW]
 // result: [N, OC, OH, OW]
 struct ggml_tensor * ggml_conv_2d(
@@ -4563,7 +4574,7 @@ struct ggml_tensor * ggml_conv_2d(
     struct ggml_tensor * result =
         ggml_mul_mat(ctx,
                 ggml_reshape_2d(ctx, im2col, im2col->ne[0],  im2col->ne[3] * im2col->ne[2] * im2col->ne[1]), // [N, OH, OW, IC * KH * KW] => [N*OH*OW, IC * KH * KW]
-                ggml_reshape_2d(ctx, a, (a->ne[0] * a->ne[1] * a->ne[2]),  a->ne[3]));                       // [OCï¼ŒIC, KH, KW] => [OC, IC * KH * KW]
+                ggml_reshape_2d(ctx, a, (a->ne[0] * a->ne[1] * a->ne[2]),  a->ne[3]));                       // [OC?¼ŒIC, KH, KW] => [OC, IC * KH * KW]
 
     result = ggml_reshape_4d(ctx, result, im2col->ne[1], im2col->ne[2], im2col->ne[3], a->ne[3]); // [OC, N, OH, OW]
     result = ggml_cont(ctx, ggml_permute(ctx, result, 0, 1, 3, 2)); // [N, OC, OH, OW]
@@ -4693,7 +4704,7 @@ struct ggml_tensor * ggml_conv_2d_dw(
                                         s0, s1, p0, p1, d0, d1, true, GGML_TYPE_F16); // [N * IC, OH, OW, KH * KW]
     struct ggml_tensor * new_b = ggml_reshape_4d(ctx, im2col, im2col->ne[0], im2col->ne[2] * im2col->ne[1], b->ne[2], b->ne[3]); // [N * IC, OH, OW, KH * KW] => [N, IC, OH * OW, KH * KW]
 
-    new_a = ggml_reshape_4d(ctx, new_a, (new_a->ne[0] * new_a->ne[1]), new_a->ne[2],  new_a->ne[3], 1);                       // [OCï¼Œ1, KH, KW] => [1, OC, 1, KH * KW]
+    new_a = ggml_reshape_4d(ctx, new_a, (new_a->ne[0] * new_a->ne[1]), new_a->ne[2],  new_a->ne[3], 1);                       // [OC?¼?1, KH, KW] => [1, OC, 1, KH * KW]
     struct ggml_tensor * result = ggml_mul_mat(ctx, new_a, new_b);
     result = ggml_reshape_4d(ctx, result, im2col->ne[1], im2col->ne[2], b->ne[2], b->ne[3]); // [N, OC, OH, OW]
 
@@ -4962,6 +4973,7 @@ static struct ggml_tensor * ggml_interpolate_impl(
     GGML_ASSERT((mode & 0xFF) < GGML_SCALE_MODE_COUNT);
     // TODO: implement antialias for modes other than bilinear
     GGML_ASSERT(!(mode & GGML_SCALE_FLAG_ANTIALIAS) || (mode & 0xFF) == GGML_SCALE_MODE_BILINEAR);
+    GGML_ASSERT(a->type == GGML_TYPE_F32);
 
     struct ggml_tensor * result = ggml_new_tensor_4d(ctx, a->type, ne0, ne1, ne2, ne3);
 
@@ -5307,6 +5319,7 @@ struct ggml_tensor * ggml_flash_attn_ext(
     GGML_ASSERT(q->ne[3] == v->ne[3]);
 
     if (mask) {
+        GGML_ASSERT(mask->type == GGML_TYPE_F16);
         GGML_ASSERT(ggml_is_contiguous(mask));
         //GGML_ASSERT(ggml_can_repeat_rows(mask, qk));
 
@@ -6642,19 +6655,22 @@ static void ggml_compute_backward(
                 ggml_add_or_set(ctx, cgraph, isrc0, ggml_transpose(ctx, grad));
             }
         } break;
+        case GGML_OP_SET_ROWS: {
+            // set_rows(a=dest, b=new_rows, c=indices): result[c[i],:] = b[i,:]
+            // grad_b[i,:] = grad_result[c[i],:] = get_rows(grad_result, c)
+            // src[0]=b (new rows), src[1]=c (indices), src[2]=a (dest/view_src)
+            if (src0_needs_grads) {
+                ggml_add_or_set(ctx, cgraph, isrc0, ggml_get_rows(ctx, grad, src1));
+            }
+            // src1 (indices) is integer type, no gradient
+            // src2 (destination = k/v cache) is not a PARAM, gradient not needed
+        } break;
         case GGML_OP_GET_ROWS: {
             if (src0_needs_grads) {
                 ggml_add_or_set(ctx, cgraph, isrc0, ggml_get_rows_back(ctx, grad, src1, src0));
             }
             if (src1_needs_grads) {
                 // noop
-            }
-        } break;
-        case GGML_OP_SET_ROWS: {
-            // d(loss)/d(b[i]) = grad[c[i]]  =>  ggml_get_rows(grad, indices)
-            // src[0]=b (data written), src[1]=c (indices), src[2]=a (dest buffer, not differentiated)
-            if (src0_needs_grads) {
-                ggml_add_or_set(ctx, cgraph, isrc0, ggml_get_rows(ctx, grad, src1));
             }
         } break;
         case GGML_OP_DIAG_MASK_INF: {
@@ -6782,13 +6798,10 @@ static void ggml_compute_backward(
                     }
                 } break;
                 case GGML_UNARY_OP_SIGMOID: {
-                    // d/dx sigmoid(x) = sigmoid(x) * (1 - sigmoid(x))
-                    // Since 1 - sigmoid(x) == sigmoid(-x), avoid needing a constant-1 tensor:
-                    // grad_src0 = grad * tensor * sigmoid(-src0)
                     if (src0_needs_grads) {
-                        struct ggml_tensor * sig_neg = ggml_sigmoid(ctx, ggml_neg(ctx, src0));
+                        // d/dx sigmoid(x) = sigmoid(x) * (1 - sigmoid(x)) = tensor * (1 - tensor)
                         ggml_add_or_set(ctx, cgraph, isrc0,
-                                        ggml_mul(ctx, grad, ggml_mul(ctx, tensor, sig_neg)));
+                            ggml_mul(ctx, grad, ggml_mul(ctx, tensor, ggml_scale_bias(ctx, tensor, -1.0f, 1.0f))));
                     }
                 } break;
                 default: {
@@ -6822,6 +6835,24 @@ static void ggml_compute_backward(
         } break;
         case GGML_OP_NONE: {
             // noop
+        } break;
+        case GGML_OP_GATED_DELTA_NET: {
+            // Full BPTT backward not implemented.
+            // Zero gradient is propagated to inputs (stops gradient flow through delta-net state).
+            // LoRA weights in the output projection (after this op) will still receive correct gradients.
+            // Note: we must call ggml_add_or_set for any src that needs_grads to avoid a NULL pointer
+            //       dereference in the shape assertions below (cgraph->grads[isrcN] would remain null).
+            // Note: src tensors may be non-contiguous (e.g. after permute), so ggml_cont is used
+            //       before ggml_scale since ggml_scale requires ggml_is_padded_1d.
+            if (src0_needs_grads) {
+                ggml_add_or_set(ctx, cgraph, isrc0, ggml_scale(ctx, ggml_cont(ctx, src0), 0.0f));
+            }
+            if (src1_needs_grads) {
+                ggml_add_or_set(ctx, cgraph, isrc1, ggml_scale(ctx, ggml_cont(ctx, src1), 0.0f));
+            }
+            if (src2_needs_grads) {
+                ggml_add_or_set(ctx, cgraph, isrc2, ggml_scale(ctx, ggml_cont(ctx, src2), 0.0f));
+            }
         } break;
         case GGML_OP_COUNT:
         default: {
@@ -6996,14 +7027,7 @@ void ggml_build_backward_expand(
                 ignore_src[1] = true;
                 break;
 
-            // SET_ROWS: gradient flows back to written data (src[0]) via GET_ROWS
-            // indices (src[1]) and dest buffer (src[2]) are not differentiable
-            case GGML_OP_SET_ROWS:
-                ignore_src[1] = true; // indices not differentiable
-                ignore_src[2] = true; // dest buffer not needed for LoRA training
-                break;
-
-            // recurrent/SSM ops: no backward implemented; gradient flows via residual connections
+            // recurrent ops: full BPTT backward not implemented; gradient stops here
             case GGML_OP_GATED_DELTA_NET:
                 ignore_src[0] = true; // q
                 ignore_src[1] = true; // k
@@ -7011,22 +7035,6 @@ void ggml_build_backward_expand(
                 ignore_src[3] = true; // g/gate
                 ignore_src[4] = true; // beta
                 ignore_src[5] = true; // state
-                break;
-            case GGML_OP_RWKV_WKV7:
-                ignore_src[0] = true;
-                ignore_src[1] = true;
-                ignore_src[2] = true;
-                ignore_src[3] = true;
-                ignore_src[4] = true;
-                ignore_src[5] = true;
-                break;
-            case GGML_OP_SSM_SCAN:
-                ignore_src[0] = true;
-                ignore_src[1] = true;
-                ignore_src[2] = true;
-                ignore_src[3] = true;
-                ignore_src[4] = true;
-                ignore_src[5] = true;
                 break;
 
             default:
@@ -7218,12 +7226,7 @@ void ggml_graph_cpy(struct ggml_cgraph * src, struct ggml_cgraph * dst) {
 }
 
 struct ggml_cgraph * ggml_graph_dup(struct ggml_context * ctx, struct ggml_cgraph * cgraph, bool force_grads) {
-    // backward (grad) graphs need more nodes than the forward graph (grads for each op),
-    // so allocate 4x the forward size when creating a grad-enabled duplicate.
-    // Note: always apply 4x when force_grads is true, even if cgraph->grads is already set,
-    // because backward_expand will add new nodes for each forward node.
-    const size_t dst_size = force_grads ? cgraph->size * 4 : cgraph->size;
-    struct ggml_cgraph * result = ggml_new_graph_custom(ctx, dst_size, cgraph->grads || force_grads);
+    struct ggml_cgraph * result = ggml_new_graph_custom(ctx, cgraph->size, cgraph->grads || force_grads);
     ggml_graph_cpy(cgraph, result);
     return result;
 }
@@ -7706,6 +7709,7 @@ size_t ggml_quantize_chunk(
     size_t result = 0;
 
     switch (type) {
+        case GGML_TYPE_Q1_0:    result = quantize_q1_0(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q4_0:    result = quantize_q4_0(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q4_1:    result = quantize_q4_1(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q5_0:    result = quantize_q5_0(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
